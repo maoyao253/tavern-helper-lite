@@ -14,7 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
-    const VERSION = '0.1.3';
+    const VERSION = '0.1.4';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -370,10 +370,17 @@
         ].join('');
         const reporter = [
             '(function(){',
-            'function send(){try{parent.postMessage({__thLite:1,uid:' + JSON.stringify(uid) + ',',
-            'h:Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0)}, "*");}catch(e){}}',
+            'function measure(){var h=0,de=document.documentElement,b=document.body;',
+            // 绝对定位/100vh 的内容不在 scrollHeight 里，按所有元素的实际下边缘取最大值
+            'if(b){var els=b.querySelectorAll("*");for(var i=0;i<els.length;i++){var r=els[i].getBoundingClientRect();if(r.bottom>h)h=r.bottom;}',
+            'h=Math.max(h,b.scrollHeight,b.offsetHeight);}',
+            'return Math.ceil(Math.max(h,de.scrollHeight,de.offsetHeight));}',
+            'function send(){try{parent.postMessage({__thLite:1,uid:' + JSON.stringify(uid) + ',h:measure()}, "*");}catch(e){}}',
             'window.addEventListener("load",send);document.addEventListener("DOMContentLoaded",send);',
-            'try{new MutationObserver(send).observe(document.documentElement,{childList:true,subtree:true,attributes:true});}catch(e){}',
+            'window.addEventListener("resize",send);',
+            'try{new MutationObserver(send).observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});}catch(e){}',
+            'try{if(window.ResizeObserver){new ResizeObserver(send).observe(document.body||document.documentElement);}}catch(e){}',
+            'try{var ims=document.querySelectorAll("img");for(var k=0;k<ims.length;k++){ims[k].addEventListener("load",send);ims[k].addEventListener("error",send);}}catch(e){}',
             'setInterval(send,1000);send();})();',
         ].join('');
         return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body>'
@@ -435,7 +442,7 @@
         if (!data || data.__thLite !== 1 || !data.uid) return;
         const frame = document.querySelector('iframe[data-th-lite-uid="' + data.uid + '"]');
         if (!frame) return;
-        const height = Math.max(60, Math.min(settings.maxHeight, Number(data.h) || 0));
+        const height = Math.max(40, Math.min(settings.maxHeight, Number(data.h) || 0));
         if (height > 0) frame.style.height = height + 'px';
     });
 
@@ -531,7 +538,7 @@
         '.th-lite-row>label{flex:1 1 auto;}',
         '.th-lite-note{opacity:.7;font-size:.85em;margin:2px 0;}',
         '.th-lite-frame{width:100%;margin:6px 0;}',
-        '.th-lite-iframe{width:100%;height:90px;border:0;border-radius:8px;background:transparent;display:block;}',
+        '.th-lite-iframe{width:100%;height:120px;border:0;border-radius:8px;background:transparent;display:block;}',
         '.th-lite-vars{width:100%;min-height:90px;max-height:260px;font-family:monospace;font-size:.85em;}',
         '.th-lite-badge{font-size:.8em;opacity:.75;}',
     ].join('');
