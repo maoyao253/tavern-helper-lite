@@ -14,7 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
-    const VERSION = '0.1.4';
+    const VERSION = '0.2.0';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -29,6 +29,8 @@
         injectVars: true,
         injectDepth: 2,
         maxHeight: 1200,
+        hostScripts: true,
+        hostSkipBundles: true,
     };
 
     let ctx = null;
@@ -237,11 +239,28 @@
         return out;
     }
 
+    /** 卡里内嵌的初始变量（MVU 的"初始变量"语义），回放的起点。 */
+    function cardInitialVariables() {
+        const characters = (ctx && ctx.characters) || [];
+        const index = Number(ctx && ctx.characterId);
+        const character = Number.isInteger(index) && index >= 0 ? characters[index] : null;
+        const holder = character && character.data && character.data.extensions
+            ? character.data.extensions.tavern_helper || character.data.extensions.TavernHelper
+            : null;
+        if (!holder || !holder.variables || typeof holder.variables !== 'object') return {};
+        try {
+            return JSON.parse(JSON.stringify(holder.variables));
+        } catch (err) {
+            debug('初始变量解析失败', err);
+            return {};
+        }
+    }
+
     /** 回放整段对话里的变量更新，写回 chat_metadata.variables。 */
     function recompute(force) {
         if (!settings.mvuEnabled && !force) return;
         const chat = (ctx && ctx.chat) || [];
-        const tree = {};
+        const tree = cardInitialVariables();
         let applied = 0;
         let lastFloor = -1;
         for (let i = 0; i < chat.length; i++) {
@@ -512,6 +531,7 @@
         if (JSON.stringify(mvuTree) === before) return false;
         persist();
         pushPrompt();
+        busEmit(MVU_EVENTS.VARIABLE_UPDATE_ENDED, { stat_data: mvuTree });
         return true;
     }
 
@@ -529,6 +549,149 @@
                 console.error(TAG, '渲染失败', err);
             }
         }, delay === undefined ? 120 : delay);
+    }
+
+    // ---------------------------------------------------------------- 卡内脚本宿主
+
+    const MVU_EVENTS = {
+        VARIABLE_INITIALIZED: 'mvu:variable_initialized',
+        VARIABLE_UPDATE_STARTED: 'mvu:variable_update_started',
+        VARIABLE_UPDATE_ENDED: 'mvu:variable_update_ended',
+    };
+    const HOST_KEY = 'th_lite_host';
+
+    const hostBus = new Map();
+    let hostState = { key: '', results: [], nodes: [] };
+
+    function busOn(name, handler, once) {
+        if (typeof handler !== 'function') return () => {};
+        if (!hostBus.has(name)) hostBus.set(name, new Set());
+        const wrapped = once
+            ? (payload) => { busOff(name, wrapped); handler(payload); }
+            : handler;
+        hostBus.get(name).add(wrapped);
+        return () => busOff(name, wrapped);
+    }
+
+    function busOff(name, handler) {
+        const set = hostBus.get(name);
+        if (set) set.delete(handler);
+    }
+
+    function busEmit(name, payload) {
+        const set = hostBus.get(name);
+        if (!set) return;
+        for (const handler of Array.from(set)) {
+            try {
+                handler(payload);
+            } catch (err) {
+                debug('事件处理失败', name, err);
+            }
+        }
+    }
+
+    /** MVU 兼容层：把 Lite 的变量树当作 MVU 的 stat_data 暴露出去。 */
+    function mvuShim() {
+        return {
+            events: MVU_EVENTS,
+            getMvuData() {
+                const statData = mvuTree && typeof mvuTree === 'object' ? mvuTree : {};
+                return {
+                    stat_data: statData,
+                    statData,
+                    display_data: {},
+                    initialized: Object.keys(statData).length > 0,
+                };
+            },
+            isMvuDataReady() {
+                return true;
+            },
+            replaceVariables(text) {
+                return substituteLiteVars(String(text === undefined || text === null ? '' : text));
+            },
+        };
+    }
+
+    /** 只补缺失的全局；已存在（例如官方酒馆助手在跑）就不覆盖。 */
+    function installHostGlobals() {
+        if (typeof window.Mvu !== 'object' || window.Mvu === null) window.Mvu = mvuShim();
+        if (typeof window.waitGlobalInitialized !== 'function') {
+            window.waitGlobalInitialized = async (name) => {
+                const started = Date.now();
+                while (!window[name] && Date.now() - started < 8000) {
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                }
+                return window[name];
+            };
+        }
+        if (typeof window.eventOn !== 'function') window.eventOn = (name, handler) => busOn(name, handler, false);
+        if (typeof window.eventOnce !== 'function') window.eventOnce = (name, handler) => busOn(name, handler, true);
+        if (typeof window.eventOff !== 'function') window.eventOff = (name, handler) => busOff(name, handler);
+        if (typeof window.eventEmit !== 'function') window.eventEmit = (name, payload) => busEmit(name, payload);
+    }
+
+    /** 当前角色卡里内嵌的酒馆助手脚本。 */
+    function cardScripts() {
+        const characters = (ctx && ctx.characters) || [];
+        const index = Number(ctx && ctx.characterId);
+        const character = Number.isInteger(index) && index >= 0 ? characters[index] : null;
+        const holder = character && character.data && character.data.extensions
+            ? character.data.extensions.tavern_helper || character.data.extensions.TavernHelper
+            : null;
+        const scripts = holder && Array.isArray(holder.scripts) ? holder.scripts : [];
+        return scripts.filter((s) => s && s.enabled !== false && typeof s.content === 'string' && s.content.trim());
+    }
+
+    /** 自带的 MVU/Zod 打包脚本会和 Lite 的兼容层打架，默认跳过。 */
+    function isBundleScript(content) {
+        return /MagVarUpdate|mvu_zod|registerMvuSchema/i.test(content);
+    }
+
+    async function runCardScripts(force) {
+        if (!settings.hostScripts) return;
+        const scripts = cardScripts();
+        if (!scripts.length) {
+            hostState = { key: '', results: [], nodes: [] };
+            return;
+        }
+        const key = String((ctx && ctx.characterId) || '') + '#' + scripts.length;
+        if (!force && hostState.key === key) return;
+
+        // 换角色时清掉上一批脚本挂到 body 上的节点（悬浮窗这类）
+        for (const node of hostState.nodes) {
+            try {
+                node.remove();
+            } catch (err) {
+                debug('清理脚本节点失败', err);
+            }
+        }
+        const before = new Set(Array.from(document.body.children));
+
+        installHostGlobals();
+        const results = [];
+        for (const script of scripts) {
+            const name = script.name || script.id || '(未命名脚本)';
+            if (settings.hostSkipBundles && isBundleScript(script.content)) {
+                results.push(name + ': 跳过（MVU/Zod 打包脚本，由 Lite 兼容层接管）');
+                continue;
+            }
+            try {
+                const factory = new Function('return (async () => {\n' + script.content + '\n})();');
+                await factory.call(window);
+                results.push(name + ': 已执行');
+            } catch (err) {
+                const message = err && err.message ? err.message : String(err);
+                results.push(name + ': 失败 ' + message);
+                console.error(TAG, '卡内脚本执行失败', name, err);
+            }
+        }
+        hostState = {
+            key,
+            results,
+            nodes: Array.from(document.body.children).filter((node) => !before.has(node)),
+        };
+        busEmit(MVU_EVENTS.VARIABLE_INITIALIZED, { stat_data: mvuTree });
+        debug('卡内脚本宿主完成', hostState);
     }
 
     // ---------------------------------------------------------------- 面板
@@ -580,6 +743,8 @@
         for (const name of names) lines.push(name + ': ' + (ctx[name] === undefined ? '缺失' : '有'));
         lines.push('对话消息数: ' + (((ctx.chat || []).length)));
         lines.push('渲染模式: ' + (settings.renderEnabled ? '开' : '关') + ' / MVU: ' + (settings.mvuEnabled ? '开' : '关'));
+        lines.push('卡内脚本: ' + (settings.hostScripts ? '开' : '关')
+            + (hostState.results.length ? ' · ' + hostState.results.join(' | ') : ' · 未检测到卡内脚本'));
         lines.push('变量键数: ' + Object.keys(mvuTree).length);
         const meta = chatMeta();
         const info = meta && meta[META_KEY];
@@ -640,6 +805,21 @@
         body.appendChild(toggleRow('把变量表注入提示词', 'injectVars', () => {
             pushPrompt();
             refresh();
+        }));
+        body.appendChild(toggleRow('运行卡内脚本（悬浮窗等酒馆助手脚本）', 'hostScripts', (on) => {
+            if (on) {
+                Promise.resolve(runCardScripts(true)).then(() => refresh('卡内脚本已执行'));
+            } else {
+                for (const node of hostState.nodes) {
+                    try {
+                        node.remove();
+                    } catch (err) {
+                        debug('清理脚本节点失败', err);
+                    }
+                }
+                hostState = { key: '', results: [], nodes: [] };
+                refresh('卡内脚本已关闭并清理挂载节点');
+            }
         }));
 
         const depthRow = el('div', 'th-lite-row');
@@ -755,6 +935,7 @@
             ev.on(et.CHAT_CHANGED, () => {
                 recompute(true);
                 pushPrompt();
+                runCardScripts();
                 scheduleRender(200);
                 if (panel) panel.refresh('已切换对话');
             });
@@ -773,6 +954,7 @@
         if (!panel) console.warn(TAG, '未找到 #extensions_settings，面板未挂载');
         recompute(true);
         pushPrompt();
+        Promise.resolve(runCardScripts()).catch((err) => debug('卡内脚本宿主失败', err));
         wireEvents(panel);
         scheduleRender(300);
         setTimeout(() => scheduleRender(0), 1500);
