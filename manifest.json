@@ -1,0 +1,11 @@
+{
+  "display_name": "酒馆助手 Lite",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "maoyao253",
+  "version": "0.1.0",
+  "homePage": "",
+  "auto_update": false
+}
