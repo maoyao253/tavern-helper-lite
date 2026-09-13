@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 酒馆助手 Lite — SillyTavern 扩展（目标：ST 1.12.x ~ 1.18.x，含老内核 1.12.3）
  *
  * 设计约束：本文件不 import 任何 SillyTavern 模块。老内核缺少新模块的具名导出时，
@@ -14,7 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -44,6 +44,14 @@
     function stCtx() {
         const api = window.SillyTavern;
         return api && typeof api.getContext === 'function' ? api.getContext() : null;
+    }
+
+    /**
+     * getContext() 返回的是快照：characterId / chat / chatMetadata 都是调用那一刻的值。
+     * 启动时取一次会永远停留在"还没选角色"的状态，所以动态字段必须每次重新取。
+     */
+    function liveCtx() {
+        return stCtx() || ctx;
     }
 
     function ready(fn) {
@@ -76,7 +84,8 @@
     }
 
     function chatMeta() {
-        return (ctx && ctx.chatMetadata) || null;
+        const live = liveCtx();
+        return (live && live.chatMetadata) || null;
     }
 
     function debug(...args) {
@@ -241,8 +250,9 @@
 
     /** 卡里内嵌的初始变量（MVU 的"初始变量"语义），回放的起点。 */
     function cardInitialVariables() {
-        const characters = (ctx && ctx.characters) || [];
-        const index = Number(ctx && ctx.characterId);
+        const live = liveCtx();
+        const characters = (live && live.characters) || [];
+        const index = Number(live && live.characterId);
         const character = Number.isInteger(index) && index >= 0 ? characters[index] : null;
         const holder = character && character.data && character.data.extensions
             ? character.data.extensions.tavern_helper || character.data.extensions.TavernHelper
@@ -259,7 +269,8 @@
     /** 回放整段对话里的变量更新，写回 chat_metadata.variables。 */
     function recompute(force) {
         if (!settings.mvuEnabled && !force) return;
-        const chat = (ctx && ctx.chat) || [];
+        const live = liveCtx();
+        const chat = (live && live.chat) || [];
         const tree = cardInitialVariables();
         let applied = 0;
         let lastFloor = -1;
@@ -306,7 +317,8 @@
     /** 取楼层原文；ST 的清洗会改 DOM，判断块位置必须用原始消息文本。 */
     function rawMessageText(mesEl) {
         const id = Number(mesEl.getAttribute('mesid'));
-        const chat = (ctx && ctx.chat) || [];
+        const live = liveCtx();
+        const chat = (live && live.chat) || [];
         const message = Number.isInteger(id) ? chat[id] : null;
         return message && typeof message.mes === 'string' ? message.mes : '';
     }
@@ -632,8 +644,9 @@
 
     /** 当前角色卡里内嵌的酒馆助手脚本。 */
     function cardScripts() {
-        const characters = (ctx && ctx.characters) || [];
-        const index = Number(ctx && ctx.characterId);
+        const live = liveCtx();
+        const characters = (live && live.characters) || [];
+        const index = Number(live && live.characterId);
         const character = Number.isInteger(index) && index >= 0 ? characters[index] : null;
         const holder = character && character.data && character.data.extensions
             ? character.data.extensions.tavern_helper || character.data.extensions.TavernHelper
@@ -645,6 +658,29 @@
     /** 自带的 MVU/Zod 打包脚本会和 Lite 的兼容层打架，默认跳过。 */
     function isBundleScript(content) {
         return /MagVarUpdate|mvu_zod|registerMvuSchema/i.test(content);
+    }
+
+    /**
+     * 卡内脚本可能带 import/export 与顶层 await，优先按 ES 模块执行；
+     * 环境不允许 blob 模块（CSP 等）时回退到 Function 包装。
+     */
+    async function executeScript(source) {
+        const code = String(source);
+        try {
+            const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+            try {
+                await import(url);
+                return;
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        } catch (err) {
+            const message = String((err && err.message) || err);
+            if (!/import|export|Content Security|CSP|not allowed|blob/i.test(message)) throw err;
+            debug('模块方式执行失败，回退 Function', message);
+        }
+        const factory = new Function('return (async () => {\n' + code + '\n})();');
+        await factory.call(window);
     }
 
     async function runCardScripts(force) {
@@ -676,8 +712,7 @@
                 continue;
             }
             try {
-                const factory = new Function('return (async () => {\n' + script.content + '\n})();');
-                await factory.call(window);
+                await executeScript(script.content);
                 results.push(name + ': 已执行');
             } catch (err) {
                 const message = err && err.message ? err.message : String(err);
