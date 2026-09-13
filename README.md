@@ -1,5 +1,7 @@
 # 酒馆助手 Lite
 
+> 📖 **功能、实现原理、制卡指南与已知问题：[功能说明与制卡指南.md](功能说明与制卡指南.md)**
+
 给**老内核酒馆**（如 SillyTavern 1.12.3）用的轻量扩展：**HTML 前端渲染 + MVU 变量**。
 零静态 `import`，全部能力走 `window.SillyTavern.getContext()`，兼容 1.12.x ~ 1.18.x。
 
