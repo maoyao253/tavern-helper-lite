@@ -14,7 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
-    const VERSION = '0.1.1';
+    const VERSION = '0.1.2';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -284,19 +284,53 @@
         }
     }
 
-    /** 变量更新块属于控制流，不该出现在正文里。 */
-    function hideUpdateBlocks(textEl) {
+    /** 取楼层原文；ST 的清洗会改 DOM，判断块位置必须用原始消息文本。 */
+    function rawMessageText(mesEl) {
+        const id = Number(mesEl.getAttribute('mesid'));
+        const chat = (ctx && ctx.chat) || [];
+        const message = Number.isInteger(id) ? chat[id] : null;
+        return message && typeof message.mes === 'string' ? message.mes : '';
+    }
+
+    /**
+     * 变量更新块属于控制流，不该出现在正文里。
+     * ST 的消息清洗会把 <UpdateVariable> 标签剥掉只留内容，所以按内容匹配；
+     * 匹配到只删块内容，不整段删，避免连带删掉同一段里的正文。
+     */
+    function hideUpdateBlocks(textEl, rawText) {
+        const needles = [];
+        const re = /<UpdateVariable>([\s\S]*?)<\/UpdateVariable>/gi;
+        let match;
+        while ((match = re.exec(String(rawText || ''))) !== null) {
+            const payload = match[1].trim();
+            if (payload.length >= 6) needles.push(payload);
+        }
+        // 没有原文线索时仍然按字面标签兜底，避免正文里残留控制块
         const walker = document.createTreeWalker(textEl, NodeFilter.SHOW_TEXT);
-        const targets = [];
+        const jobs = [];
         let node;
         while ((node = walker.nextNode()) !== null) {
-            if (node.nodeValue && node.nodeValue.indexOf('<UpdateVariable>') >= 0) targets.push(node);
+            const value = (node.nodeValue || '').trim();
+            if (!value) continue;
+            const isMarker = value.indexOf('<UpdateVariable>') >= 0 || value.indexOf('</UpdateVariable>') >= 0;
+            const isPayload = value.length >= 6
+                && needles.some((p) => p.indexOf(value) >= 0 || value.indexOf(p) >= 0);
+            if (isMarker || isPayload) jobs.push({ node, isMarker });
         }
-        for (const textNode of targets) {
-            let host = textNode.parentElement;
-            while (host && host !== textEl && !BLOCK_TAGS.test(host.tagName)) host = host.parentElement;
-            if (host && host !== textEl) host.remove();
-            else textNode.remove();
+
+        for (const job of jobs) {
+            let rest = job.isMarker ? '' : job.node.nodeValue;
+            if (!job.isMarker) {
+                for (const payload of needles) rest = rest.split(payload).join('');
+            }
+            if (rest.trim() === '') {
+                let host = job.node.parentElement;
+                while (host && host !== textEl && !BLOCK_TAGS.test(host.tagName)) host = host.parentElement;
+                if (host && host !== textEl) host.remove();
+                else job.node.remove();
+            } else {
+                job.node.nodeValue = rest;
+            }
         }
     }
 
@@ -396,7 +430,7 @@
     function renderMessage(mesEl) {
         const textEl = mesEl.querySelector('.mes_text');
         if (!textEl) return 0;
-        if (settings.hideUpdateBlocks) hideUpdateBlocks(textEl);
+        if (settings.hideUpdateBlocks) hideUpdateBlocks(textEl, rawMessageText(mesEl));
 
         const uidBase = String(mesEl.getAttribute('mesid') || 'x');
         let count = 0;
@@ -694,6 +728,8 @@
         renderAll,
         pushPrompt,
         probe,
+        hideUpdateBlocks,
+        rawMessageText,
         get tree() { return mvuTree; },
     };
 
