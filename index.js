@@ -14,7 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
-    const VERSION = '0.1.2';
+    const VERSION = '0.1.3';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -292,36 +292,62 @@
         return message && typeof message.mes === 'string' ? message.mes : '';
     }
 
+    const BLOCK_SELECTOR = 'p, li, div, pre, blockquote, td, h1, h2, h3, h4, h5, h6, code';
+
+    /** 去掉空白与各种引号写法：ST 渲染时的空白折叠/排版差异不该影响匹配。 */
+    function normalizeText(value) {
+        return String(value || '').replace(/[\s"'“”‘’`]/g, '');
+    }
+
     /**
      * 变量更新块属于控制流，不该出现在正文里。
-     * ST 的消息清洗会把 <UpdateVariable> 标签剥掉只留内容，所以按内容匹配；
-     * 匹配到只删块内容，不整段删，避免连带删掉同一段里的正文。
+     * ST 的消息清洗会把 <UpdateVariable> 标签剥掉只留内容，渲染还可能折叠空白、把块拆成多个节点，
+     * 因此按"规范化后的内容"在块级元素上匹配；块夹在正文中间时只删块内容、保留正文。
      */
     function hideUpdateBlocks(textEl, rawText) {
-        const needles = [];
+        const raw = String(rawText || '');
+        const literalTag = (textEl.textContent || '').indexOf('<UpdateVariable>') >= 0;
+        if (raw.indexOf('<UpdateVariable>') < 0 && !literalTag) return;
+
+        const payloads = [];
         const re = /<UpdateVariable>([\s\S]*?)<\/UpdateVariable>/gi;
         let match;
-        while ((match = re.exec(String(rawText || ''))) !== null) {
+        while ((match = re.exec(raw)) !== null) {
             const payload = match[1].trim();
-            if (payload.length >= 6) needles.push(payload);
+            if (payload.length >= 6) payloads.push({ raw: payload, norm: normalizeText(payload) });
         }
-        // 没有原文线索时仍然按字面标签兜底，避免正文里残留控制块
+
+        for (const block of Array.from(textEl.querySelectorAll(BLOCK_SELECTOR))) {
+            if (block.querySelector('iframe')) continue;
+            const text = (block.textContent || '').trim();
+            if (!text) continue;
+            const norm = normalizeText(text);
+            if (!norm) continue;
+            const wholeBlock = payloads.some((p) => p.norm === norm);
+            const fragment = payloads.some((p) => p.norm.length > norm.length && p.norm.indexOf(norm) >= 0);
+            const onlyTag = /^<\/?UpdateVariable>$/i.test(text);
+            // 原文里确有更新块时，纯 JSON 段落一律按控制块处理，覆盖空白折叠与节点拆分
+            const jsonOnly = payloads.length > 0 && /^\{[\s\S]*\}$|^\[[\s\S]*\]$/.test(norm);
+            if (wholeBlock || fragment || onlyTag || jsonOnly) block.remove();
+        }
+
         const walker = document.createTreeWalker(textEl, NodeFilter.SHOW_TEXT);
         const jobs = [];
         let node;
         while ((node = walker.nextNode()) !== null) {
-            const value = (node.nodeValue || '').trim();
-            if (!value) continue;
-            const isMarker = value.indexOf('<UpdateVariable>') >= 0 || value.indexOf('</UpdateVariable>') >= 0;
-            const isPayload = value.length >= 6
-                && needles.some((p) => p.indexOf(value) >= 0 || value.indexOf(p) >= 0);
-            if (isMarker || isPayload) jobs.push({ node, isMarker });
+            const value = node.nodeValue || '';
+            if (!value.trim()) continue;
+            if (value.indexOf('<UpdateVariable>') >= 0 || value.indexOf('</UpdateVariable>') >= 0) {
+                jobs.push({ node, whole: true });
+                continue;
+            }
+            if (payloads.some((p) => value.indexOf(p.raw) >= 0)) jobs.push({ node, whole: false });
         }
 
         for (const job of jobs) {
-            let rest = job.isMarker ? '' : job.node.nodeValue;
-            if (!job.isMarker) {
-                for (const payload of needles) rest = rest.split(payload).join('');
+            let rest = job.whole ? '' : job.node.nodeValue;
+            if (!job.whole) {
+                for (const payload of payloads) rest = rest.split(payload.raw).join('');
             }
             if (rest.trim() === '') {
                 let host = job.node.parentElement;
@@ -555,6 +581,26 @@
         return lines.join('\n');
     }
 
+    /** 逐楼层导出「原文 vs 渲染后 HTML」，用于定位正文里残留的控制块。 */
+    function dumpDiagnostics() {
+        const chat = (ctx && ctx.chat) || [];
+        const lines = [
+            '酒馆助手 Lite v' + VERSION,
+            '消息数=' + chat.length + '  隐藏块=' + settings.hideUpdateBlocks + '  渲染=' + settings.renderEnabled,
+            '变量键=' + Object.keys(mvuTree).length,
+        ];
+        chat.forEach((message, index) => {
+            const raw = String(message.mes || '');
+            const el = document.querySelector('#chat .mes[mesid="' + index + '"] .mes_text');
+            if (raw.indexOf('<UpdateVariable>') < 0 && !el) return;
+            lines.push('');
+            lines.push('===== 楼层 ' + index + ' =====');
+            lines.push('原文: ' + raw.slice(0, 320).replace(/\n/g, '\\n'));
+            lines.push('渲染: ' + (el ? el.innerHTML.slice(0, 320).replace(/\n/g, '\\n') : '(没有对应 DOM)'));
+        });
+        return lines.join('\n');
+    }
+
     const PREVIEW_SAMPLE = [
         '<div style="padding:10px;border-radius:10px;background:linear-gradient(135deg,#2b2b3d,#3a3a55);color:#eee">',
         '<b>前端渲染自检</b><div style="opacity:.8">好感度：{{getvar::好感度}}</div></div>',
@@ -623,9 +669,15 @@
         });
         const btnProbe = el('div', 'menu_button', '自检');
         btnProbe.addEventListener('click', () => refresh(''));
+        const btnDiag = el('div', 'menu_button', '诊断正文');
+        btnDiag.addEventListener('click', () => {
+            probeBox.value = dumpDiagnostics();
+            status.textContent = '诊断已生成：把下面文本框的内容整段复制发给我';
+        });
         buttons.appendChild(btnRender);
         buttons.appendChild(btnVars);
         buttons.appendChild(btnProbe);
+        buttons.appendChild(btnDiag);
         body.appendChild(buttons);
 
         const varsBox = el('textarea', 'text_lite_vars text_pole th-lite-vars');
@@ -730,6 +782,7 @@
         probe,
         hideUpdateBlocks,
         rawMessageText,
+        dumpDiagnostics,
         get tree() { return mvuTree; },
     };
 
