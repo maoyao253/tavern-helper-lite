@@ -14,6 +14,7 @@
     'use strict';
 
     const TAG = '[酒馆助手Lite]';
+    const VERSION = '0.1.1';
     const EXT_ID = 'th_lite';
     const META_KEY = 'th_lite_mvu';
     const PROMPT_KEY = 'th_lite_vars';
@@ -265,9 +266,10 @@
     }
 
     function persist() {
-        if (ctx && typeof ctx.saveMetadata === 'function') {
-            Promise.resolve(ctx.saveMetadata()).catch((err) => debug('保存变量失败', err));
-        }
+        if (!ctx || typeof ctx.saveMetadata !== 'function') return;
+        // 未打开任何对话时落盘没有意义，ST 会告警 saveChat called without chat_name
+        if (typeof ctx.getCurrentChatId === 'function' && !ctx.getCurrentChatId()) return;
+        Promise.resolve(ctx.saveMetadata()).catch((err) => debug('保存变量失败', err));
     }
 
     function pushPrompt() {
@@ -319,15 +321,53 @@
             + '<script>' + reporter + '<\/script></body></html>';
     }
 
-    function makeFrame(html, uid) {
-        const wrap = el('div', 'th-lite-frame');
+    /** 先填自家变量再交给 ST 的宏引擎，否则 {{getvar::}} 可能先被替换成空值。 */
+    function expandMacros(rawHtml) {
+        let html = substituteLiteVars(rawHtml);
+        if (typeof ctx.substituteParams === 'function') {
+            try {
+                html = ctx.substituteParams(html);
+            } catch (err) {
+                debug('宏替换失败', err);
+            }
+        }
+        return html;
+    }
+
+    function makeIframe(expandedHtml, uid) {
         const frame = el('iframe', 'th-lite-iframe');
         frame.setAttribute('sandbox', 'allow-scripts');
         frame.setAttribute('referrerpolicy', 'no-referrer');
         frame.dataset.thLiteUid = uid;
-        frame.srcdoc = frameDoc(html, uid);
-        wrap.appendChild(frame);
+        frame.srcdoc = frameDoc(expandedHtml, uid);
+        return frame;
+    }
+
+    /** wrap 上保留原始源码，变量变化后可以原地重画。 */
+    function buildFrame(rawHtml, uid) {
+        const html = expandMacros(rawHtml);
+        const wrap = el('div', 'th-lite-frame');
+        wrap.__thLiteSrc = rawHtml;
+        wrap.__thLiteRendered = html;
+        wrap.appendChild(makeIframe(html, uid));
         return wrap;
+    }
+
+    /** 变量更新后重画已渲染的楼层；只处理源码里含宏的块。 */
+    function refreshFrames() {
+        let count = 0;
+        for (const wrap of document.querySelectorAll('.th-lite-frame')) {
+            const raw = wrap.__thLiteSrc;
+            if (typeof raw !== 'string' || raw.indexOf('{{') < 0) continue;
+            const html = expandMacros(raw);
+            if (wrap.__thLiteRendered === html) continue;
+            wrap.__thLiteRendered = html;
+            const old = wrap.querySelector('iframe');
+            const uid = (old && old.dataset.thLiteUid) || 'f' + Date.now();
+            wrap.replaceChildren(makeIframe(html, uid));
+            count++;
+        }
+        return count;
     }
 
     window.addEventListener('message', (ev) => {
@@ -368,19 +408,9 @@
             if (!declared && !(settings.autoDetectHtml && looksLikeHtml(raw))) continue;
             if (!raw.trim()) continue;
 
-            let html = raw;
-            if (typeof ctx.substituteParams === 'function') {
-                try {
-                    html = ctx.substituteParams(raw);
-                } catch (err) {
-                    debug('宏替换失败', err);
-                }
-            }
-            html = substituteLiteVars(html);
-
             const uid = uidBase + '-' + count + '-' + Math.random().toString(36).slice(2, 7);
             const holder = code.closest('pre') || code;
-            holder.replaceWith(makeFrame(html, uid));
+            holder.replaceWith(buildFrame(raw, uid));
             count++;
         }
         return count;
@@ -401,16 +431,32 @@
         if (!settings.renderEnabled) return 0;
         let total = 0;
         for (const mesEl of document.querySelectorAll('#chat .mes')) total += renderMessage(mesEl);
+        refreshFrames();
         return total;
     }
 
     let renderTimer = null;
+    let panelRef = null;
+
+    /** 回放变量；只有结果真的变了才落盘并重推提示词。 */
+    function recomputeIfChanged() {
+        const before = JSON.stringify(mvuTree);
+        recompute();
+        if (JSON.stringify(mvuTree) === before) return false;
+        persist();
+        pushPrompt();
+        return true;
+    }
+
+    /** 楼层变化（AI 回复、自己发的消息、划卡、编辑、删除）统一走这一条管线。 */
     function scheduleRender(delay) {
         if (renderTimer) clearTimeout(renderTimer);
         renderTimer = setTimeout(() => {
             renderTimer = null;
             try {
+                const changed = settings.mvuEnabled ? recomputeIfChanged() : false;
                 renderAll();
+                if (changed && panelRef) panelRef.refresh('变量已自动更新');
             } catch (err) {
                 lastError = String(err && err.message ? err.message : err);
                 console.error(TAG, '渲染失败', err);
@@ -529,15 +575,17 @@
         const buttons = el('div', 'th-lite-row');
         const btnRender = el('div', 'menu_button', '重绘全部楼层');
         btnRender.addEventListener('click', () => {
+            recomputeIfChanged();
             const n = renderAll();
-            refresh('重绘完成，处理 ' + n + ' 个 HTML 块');
+            refresh('重绘完成：处理 ' + n + ' 个 HTML 块，并刷新了已渲染楼层');
         });
         const btnVars = el('div', 'menu_button', '重算变量');
         btnVars.addEventListener('click', () => {
             recompute(true);
             persist();
             pushPrompt();
-            refresh('变量已重算');
+            renderAll();
+            refresh('变量已重算并刷新楼层');
         });
         const btnProbe = el('div', 'menu_button', '自检');
         btnProbe.addEventListener('click', () => refresh(''));
@@ -563,16 +611,13 @@
         const pvRow = el('div', 'th-lite-row');
         const btnPreview = el('div', 'menu_button', '渲染预览');
         btnPreview.addEventListener('click', () => {
-            const html = substituteLiteVars(typeof ctx.substituteParams === 'function'
-                ? ctx.substituteParams(PREVIEW_SAMPLE)
-                : PREVIEW_SAMPLE);
-            preview.replaceChildren(makeFrame(html, 'preview-' + Date.now()));
+            preview.replaceChildren(buildFrame(PREVIEW_SAMPLE, 'preview-' + Date.now()));
         });
         pvRow.appendChild(btnPreview);
         body.appendChild(pvRow);
 
         body.appendChild(status);
-        body.appendChild(el('div', 'th-lite-note', '来源：酒馆助手 Lite v0.1.0（零静态 import，兼容老内核）'));
+        body.appendChild(el('div', 'th-lite-note', '来源：酒馆助手 Lite v' + VERSION + '（零静态 import，兼容老内核）'));
 
         drawer.appendChild(head);
         drawer.appendChild(body);
@@ -610,13 +655,8 @@
             }
         }
         if (et.MESSAGE_RECEIVED) {
-            ev.on(et.MESSAGE_RECEIVED, () => {
-                if (!settings.mvuEnabled) return;
-                recompute();
-                persist();
-                pushPrompt();
-                if (panel) panel.refresh('变量已随新消息更新');
-            });
+            // 变量回放与楼层重画都交给防抖管线，避免两条路径各刷一遍
+            ev.on(et.MESSAGE_RECEIVED, () => scheduleRender(60));
         }
         if (et.CHAT_CHANGED) {
             ev.on(et.CHAT_CHANGED, () => {
@@ -636,13 +676,14 @@
         }
         loadSettings();
         const panel = buildPanel();
+        panelRef = panel;
         if (!panel) console.warn(TAG, '未找到 #extensions_settings，面板未挂载');
         recompute(true);
         pushPrompt();
         wireEvents(panel);
         scheduleRender(300);
         setTimeout(() => scheduleRender(0), 1500);
-        console.log(TAG, '已加载（v0.1.0）');
+        console.log(TAG, '已加载（v' + VERSION + '）');
     }
 
     /** 供面板、STscript 与自动化验收调用的句柄。 */
